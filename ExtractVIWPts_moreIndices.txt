@@ -1,0 +1,526 @@
+// ExtractVIWPts_moreIndices
+// Used in the invasive grasses project
+
+// Includes function(s) from the very handy LandTrendr library (For questions on LandTrendr contact Justin Braaten jstnbraaten@gmail.com)
+// LandTrendr function getCombinedSRcollection normalizes L8 bands to L7 
+// To add the library: https://code.earthengine.google.com/?accept_repo=users/emaprlab/public
+// Parts of this script were modified from some of the examples at https://emapr.github.io/LT-GEE/api.html
+
+// Inputs:
+// geometry1 - a broad polygon that covers all the points. May not be needed depending on area to cover
+// table = u10_pts_ee or u11_pts_ee - the points that will be buffered & used to clip the veg indices with
+// table2 - these are broad polys used to clip the indices to (either extractee_u10_socalshrub (u10) or extracteewm_socalshrub (u11))
+
+//var pts = ee.FeatureCollection('users/tkohler/u10_allpts_j');
+
+var table2use = table_u11;
+var poly2use = table2_u11;
+
+var buff_pts = function(feature){
+  var buffered_pts = feature.buffer(15);
+  return ee.Feature(buffered_pts);
+};
+var bpts = table2use.map(buff_pts);
+
+Map.addLayer(bpts, {}, 'bpts');
+
+// Reference the ltgee library so LandTrendr functions can be used
+var ltgee = require('users/emaprlab/public:Modules/LandTrendr.js');
+
+// input parameters
+var tname = "u11_2009_mar2novby3";
+var startYear = 2009; 
+var endYear = 2009; 
+var startDay ='03-01';
+var endDay =   '11-29';
+var maskThese = ['cloud', 'shadow', 'snow', 'water'];
+var gDriveFolder = 'SoCalShrubs';
+
+
+var collection;
+for(var year=startYear;year<=endYear;year++){
+  collection = ltgee.getCombinedSRcollection(startYear, startDay, endYear, endDay, bpts, maskThese);
+}
+var elevation = ee.Image('USGS/NED');
+var aspect = ee.Terrain.aspect(elevation);
+
+//Map.setCenter(-118.515, 34.401);
+//Map.addLayer(aspect,{min:0,max:360},'Aspect');
+
+// Export list of features to find sensors & dates used
+Export.table.toCloudStorage({
+  collection: collection,
+  description: tname, 
+  bucket:'rsleedownloads', 
+  fileNamePrefix: tname, 
+  fileFormat: 'CSV', 
+  });
+
+// ~~~~~~~~~~~~~  confirm that masking is working as expected ~~~~~~~~~~~~~
+var first1 = collection.first();
+var vizParams = {bands: ['B3','B2', 'B1'], min: 600, max: 2500};
+Map.addLayer(first1, vizParams, 'first image from masked collection');
+
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~ START Transforms for VIs ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// NDII - Use the FIRST SWIR band (B5) & not the second for NDII
+var NDII_L57 = function(img){ 
+  img = img.normalizedDifference(['B4', 'B5']) //calc normalized dif bw ie band 4 and band 3 (B4-B3/B4+B3)
+                .select([0], ['NDII'])
+                .multiply(10000)
+                .toShort()
+                .set('system:time_start', img.get('system:time_start'))
+                .clip(poly2use)
+                .set('date', img.date());
+  return img;
+};
+
+// NDVI  NIR & Red
+var NDVI_L57 = function(img){ 
+  img = img.normalizedDifference(['B4', 'B3']) //calc normalized dif bw ie band 4 and band 3 (B4-B3/B4+B3)
+                .select([0], ['NDVI'])
+                .multiply(10000)
+                .toShort()
+                .set('system:time_start', img.get('system:time_start'))
+                .clip(poly2use)
+                .set('date', img.date());
+  return img;
+};
+// Red Green Ratio (RGA) or Arctangent of Red Green (ARG) - arctangent of B3 (red) / B2 (green)
+var ARG_L57 = function(img){ 
+  img = (img.select('B3').divide(img.select('B2')))
+                .atan()
+                .select([0], ['ARG'])
+                //convert from radians to degrees, so multiply by 180/3.14159265359 = 57.29577951308 then by 100
+                .multiply(5729.577951308)
+                .toShort()
+                .set('system:time_start', img.get('system:time_start'))
+                .clip(poly2use)
+                .set('date', img.date());
+  return img;
+};
+
+
+// Normalized Burn Ratio (NBR) - Use the SECOND SWIR band (B7) & not the first
+var NBR_L57 = function(img){ 
+  img = img.normalizedDifference(['B4', 'B7']) //calc normalized dif bw ie band 4 and band 7 (B4-B7/B4+B7)
+                .select([0], ['NBR'])
+                .multiply(10000)
+                .toShort()
+                .set('system:time_start', img.get('system:time_start'))
+                .clip(poly2use)
+                .set('date', img.date());
+  return img;
+};
+// ~~~~~~~~~~~~~~~~~~~~~~~~ END Transforms for VIs ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+var nbrcollection = collection.map(NBR_L57);
+var argcollection = collection.map(ARG_L57);
+var ndvicollection = collection.map(NDVI_L57);
+var ndiicollection = collection.map(NDII_L57);
+var band3 = collection.select('B3').filterBounds(poly2use);
+
+// ~~~~~~~~~  START summarize & transform 1 ~~~~~~~~~~~~~~~~
+// The reducer re-projects from EPSG:32611 to EPSG:4326
+var startDate = ee.Date(startYear.toString().concat('-').concat(startDay)); //.format('YYYY-MM-DD');
+var endDate = ee.Date(endYear.toString().concat('-').concat(endDay)); //.format('YYYY-MM-DD');
+
+// Statistics of veg indices will be created for each tri-monthly season
+var windows = 3; // window = how many months to use in average
+// Calculate numberOfWindows to map over them in parallel
+var numberOfWindows = endDate.difference(startDate,'month').divide(windows);
+
+// ~~~~~~~~~~~ NBR summaries
+var sequencenbr = ee.List.sequence(0, numberOfWindows); 
+// map over each sequence element, num refers to each element in sequence
+sequencenbr = sequencenbr.map(function(num){
+  num = ee.Number(num);
+  var windowStart = startDate.advance(num.multiply(windows), 'month');
+  var windowEnd = startDate.advance(num.add(1).multiply(windows), 'month');
+  var subset = nbrcollection.filterDate(windowStart,windowEnd);    // select images that fall within those windows
+  var minmax = subset.reduce(ee.Reducer.minMax()).set('system:time_start',windowStart);
+  var means = subset.reduce(ee.Reducer.mean()).set('system:time_start',windowStart);
+  var med = subset.reduce(ee.Reducer.median()).set('system:time_start',windowStart);
+  var stdev = subset.reduce(ee.Reducer.stdDev()).set('system:time_start',windowStart);
+  var out = minmax.addBands(med).addBands(means).addBands(stdev); // Select the bands to add together
+  return out;
+});
+var nbrcomposites = ee.ImageCollection.fromImages(sequencenbr);  // Convert images in the 'sequence' list to an ImageCollection
+
+//  ~~~~~~~~~~~ NDVI summaries
+var sequencendvi = ee.List.sequence(0, numberOfWindows); 
+// map over each sequence element, num refers to each element in sequence
+sequencendvi = sequencendvi.map(function(num){
+  num = ee.Number(num); // cast element of sequence to a number object
+  var windowStart = startDate.advance(num.multiply(windows), 'month');
+  var windowEnd = startDate.advance(num.add(1).multiply(windows), 'month');
+  var subset = ndvicollection.filterDate(windowStart,windowEnd);
+  var minmax = subset.reduce(ee.Reducer.minMax()).set('system:time_start',windowStart);
+  var means = subset.reduce(ee.Reducer.mean()).set('system:time_start',windowStart);
+  var med = subset.reduce(ee.Reducer.median()).set('system:time_start',windowStart);
+  var stdev = subset.reduce(ee.Reducer.stdDev()).set('system:time_start',windowStart);
+  var out = minmax.addBands(med).addBands(means).addBands(stdev);
+  return out;
+});
+var ndvicomposites = ee.ImageCollection.fromImages(sequencendvi);
+
+
+//  ~~~~~~~~~~~ NDII summaries
+var sequencendii = ee.List.sequence(0, numberOfWindows); 
+// map over each sequence element, num refers to each element in sequence
+sequencendii = sequencendii.map(function(num){
+  num = ee.Number(num);
+  var windowStart = startDate.advance(num.multiply(windows), 'month');
+  var windowEnd = startDate.advance(num.add(1).multiply(windows), 'month');
+  var subset = ndiicollection.filterDate(windowStart,windowEnd);
+  var minmax = subset.reduce(ee.Reducer.minMax()).set('system:time_start',windowStart);
+  var means = subset.reduce(ee.Reducer.mean()).set('system:time_start',windowStart);
+  var med = subset.reduce(ee.Reducer.median()).set('system:time_start',windowStart);
+  var stdev = subset.reduce(ee.Reducer.stdDev()).set('system:time_start',windowStart);
+  var out = minmax.addBands(med).addBands(means).addBands(stdev);
+  return out;
+});
+var ndiicomposites = ee.ImageCollection.fromImages(sequencendii);
+
+//var ndii_first = ndiicomposites.first();
+
+//  ~~~~~~~~~~~ B3 summaries
+var sequenceb3 = ee.List.sequence(0, numberOfWindows); 
+// map over each sequence element, num refers to each element in sequence
+sequenceb3 = sequenceb3.map(function(num){
+  num = ee.Number(num);
+  var windowStart = startDate.advance(num.multiply(windows), 'month');
+  var windowEnd = startDate.advance(num.add(1).multiply(windows), 'month');
+  var subset = band3.filterDate(windowStart,windowEnd);
+  var minmax = subset.reduce(ee.Reducer.minMax()).set('system:time_start',windowStart);
+  var means = subset.reduce(ee.Reducer.mean()).set('system:time_start',windowStart);
+  var med = subset.reduce(ee.Reducer.median()).set('system:time_start',windowStart);
+  var stdev = subset.reduce(ee.Reducer.stdDev()).set('system:time_start',windowStart);
+  var out = minmax.addBands(med).addBands(means).addBands(stdev);
+  return out;
+});
+var b3composites = ee.ImageCollection.fromImages(sequenceb3);
+
+//  ~~~~~~~~~~~ ARG summaries
+var sequencearg = ee.List.sequence(0, numberOfWindows); 
+sequencearg = sequencearg.map(function(num){
+  num = ee.Number(num);
+  var windowStart = startDate.advance(num.multiply(windows), 'month');
+  var windowEnd = startDate.advance(num.add(1).multiply(windows), 'month');
+  var subset = argcollection.filterDate(windowStart,windowEnd);
+  var minmax = subset.reduce(ee.Reducer.minMax()).set('system:time_start',windowStart);
+  var means = subset.reduce(ee.Reducer.mean()).set('system:time_start',windowStart);
+  var med = subset.reduce(ee.Reducer.median()).set('system:time_start',windowStart);
+  var stdev = subset.reduce(ee.Reducer.stdDev()).set('system:time_start',windowStart);
+  var out = minmax.addBands(med).addBands(means).addBands(stdev);
+  return out;
+});
+var argcomposites = ee.ImageCollection.fromImages(sequencearg);
+
+// ~~~~~~~~~  END summarize & transform 1 ~~~~~~~~~~~~~~~~
+
+// ~~~~~~~ START Export selected bands from selected composites ~~~~
+// This section creates the inputs to the final model & is used closer to the end of the process
+/*
+// Set projection info as needed
+// UTM 10
+var crs2use = 'EPSG:32610';  // WGS84 UTM10
+var crstransform2use = [30,0,565185,0,-30,4094715]; //u10 for P43R35
+
+// UTM 11
+//var crs2use = 'EPSG:32611';  // WGS84 UTM11
+//var crstransform2use = [30,0,547485,0,-30,3935415]; //u11
+// 0 = 03, 1 = 06, 2 = 09
+
+//ARGmaxYR03  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = argcomposites.toBands();
+var ARGmaxYR03  = bigimage.select("0_ARG_max");
+print("ARGmaxYR03 ", ARGmaxYR03 );
+var fileNamePrefix = 'ARGmax1303_0_ARG_max_u10';
+Export.image.toDrive({
+  'image': ARGmaxYR03,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+
+//ARGmaxYR06  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = argcomposites.toBands();
+var ARGmaxYR06  = bigimage.select("1_ARG_max");
+print("ARGmaxYR06 ", ARGmaxYR06 );
+var fileNamePrefix = 'ARGmax1306_1_ARG_max_u10';
+Export.image.toDrive({
+  'image': ARGmaxYR06,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+
+
+//ARGmedYR06,  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = argcomposites.toBands();
+var ARGmedYR06  = bigimage.select("1_ARG_median");
+print("ARGmedYR06 ", ARGmedYR06 );
+var fileNamePrefix = 'ARGmed1306_1_ARG_med_u10';
+Export.image.toDrive({
+  'image': ARGmedYR06,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+
+
+//ARGmedYR09,  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = argcomposites.toBands();
+var ARGmedYR09  = bigimage.select("2_ARG_median");
+print("ARGmedYR09 ", ARGmedYR09 );
+var fileNamePrefix = 'ARGmed1309_2_ARG_med_u10';
+Export.image.toDrive({
+  'image': ARGmedYR09,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+
+
+//NDVstdYR03, // 0 = 03, 1 = 06, 2 = 09 
+var bigimage = ndvicomposites.toBands();
+var NDVstdYR03  = bigimage.select("0_NDVI_stdDev");
+print("NDVstd1703 ", NDVstdYR03 );
+var fileNamePrefix = 'NDVstd1803_0_NDV_std_u10';
+Export.image.toDrive({
+  'image': NDVstdYR03,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+
+//NBRstdYR03, // 0 = 03, 1 = 06, 2 = 09 
+var bigimage = nbrcomposites.toBands();
+var NBRstdYR03  = bigimage.select("0_NBR_stdDev");
+print("NBRstdYR03 ", NBRstdYR03 );
+var fileNamePrefix = 'NBRstd1803_0_NBR_std_u10';
+Export.image.toDrive({
+  'image': NBRstdYR03,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use,  
+  'maxPixels': 1e13
+});
+
+//B3stdYR03,  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = b3composites.toBands();
+var B3stdYR03  = bigimage.select("0_B3_stdDev");
+print("B3stdYR03 ", B3stdYR03 );
+var fileNamePrefix = 'B3std1303_0_B3_std_u10';
+Export.image.toDrive({
+  'image': B3stdYR03,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+
+//B3stdYR06,  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = b3composites.toBands();
+var B3stdYR06  = bigimage.select("1_B3_stdDev");
+print("B3stdYR06 ", B3stdYR06 );
+var fileNamePrefix = 'B3std1306_1_B3_std_u10';
+Export.image.toDrive({
+  'image': B3stdYR06,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+
+//B3stdYR09,  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = b3composites.toBands();
+var B3stdYR09  = bigimage.select("2_B3_stdDev");
+print("B3stdYR09 ", B3stdYR09 );
+var fileNamePrefix = 'B3std1709_2_B3_std_u10';
+Export.image.toDrive({
+  'image': B3stdYR09,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+
+
+//B3maxYR09,  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = b3composites.toBands();
+var B3maxYR09  = bigimage.select("2_B3_max");
+print("B3maxYR09 ", B3maxYR09 );
+var fileNamePrefix = 'B3max1809_2_B3_max_u10';
+Export.image.toDrive({
+  'image': B3maxYR09,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use,  
+  'maxPixels': 1e13
+});
+
+//NDVminYR09,  // 0 = 03, 1 = 06, 2 = 09
+var bigimage = ndvicomposites.toBands();
+var NDVminYR09  = bigimage.select("2_NDVI_min");
+print("NDVminYR09 ", NDVminYR09 );
+var fileNamePrefix = 'NDVmin1309_2_NDV_min_u11';
+Export.image.toDrive({
+  'image': NDVminYR09,
+  'crs': crs2use,
+  'crsTransform': crstransform2use,
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'region': poly2use, 
+  'maxPixels': 1e13
+});
+*/
+// ~~~~~~~ END Export selected bands from selected composites ~~~~
+
+
+// ~~~~~~~  START Combining composites ~~~~~~~~~~~~~~~~
+
+// filter based on system::time_start
+var filter = ee.Filter.equals({
+  leftField: 'system:time_start',
+  rightField: 'system:time_start'
+});
+
+// Use Inner Joins - 2 at a time
+var simpleJoin = ee.Join.inner();
+var innerJoin = ee.ImageCollection(simpleJoin.apply(nbrcomposites, ndvicomposites, filter));
+var joined = innerJoin.map(function(feature) {
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+});
+
+var simpleJoin2 = ee.Join.inner();
+var innerJoin2 = ee.ImageCollection(simpleJoin2.apply(joined, ndiicomposites, filter));
+var joined2 = innerJoin2.map(function(feature) {
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+});
+
+var simpleJoin3 = ee.Join.inner();
+var innerJoin3 = ee.ImageCollection(simpleJoin3.apply(joined2, argcomposites, filter));
+var joined3 = innerJoin3.map(function(feature) {
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+});
+
+var simpleJoin4 = ee.Join.inner();
+var innerJoin4 = ee.ImageCollection(simpleJoin4.apply(joined3, b3composites, filter));
+var monthlymeanscomposites = innerJoin4.map(function(feature) {
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+});
+
+print('monthlymeanscomposites', monthlymeanscomposites);
+// This method causes a new composite image for each time period
+var first = monthlymeanscomposites.first();
+var vizParams = {bands: ['NDII_mean'], min: 3000, max: 5000};
+Map.addLayer(first, vizParams,'first image from monthlymeanscomposites collection');
+
+// ~~~~~~~  END Combining composites ~~~~~~~~~~~~~~~~
+
+
+// ~~~~~~~~~  START Reformat Into Table & export - final ~~~~~~~~~~~~~~~~
+// For each image the group of 370 polygons is repeated, so if there are 10 images with 5 bands each the output will be 10x370 polys, 
+// & each feature will have 5 properties each.
+// Collect region, image, value triplets.
+var triplets = monthlymeanscomposites.map(function(image) {
+  return image.reduceRegions({
+    collection: bpts.select(['sFIDp1']), 
+    reducer: ee.Reducer.mean(), 
+    scale: 30})
+    .map(function(f) { 
+      var date = ee.Date(image.get('system:time_start'));
+      return f.set('imageId', date);
+    });
+})
+.flatten();
+
+var desc1 = tname; 
+Export.table.toDrive({
+  collection: triplets, 
+  description: desc1, 
+  folder: gDriveFolder,
+  fileNamePrefix: desc1,
+  fileFormat: 'CSV'
+});
+// ~~~~~~~~~  END Reformat Into Table & export - final ~~~~~~~~~~~~~~~~
+
+// ~~~~~~~~~~~ START Export aspect to table (post processing add-on) ~~~~~~~~~~~~~~~~~
+// Use buffered points here
+var elevation = ee.Image('USGS/NED');
+var aspect = ee.Terrain.aspect(elevation);
+var slope = ee.Terrain.slope(elevation);
+var elist = elevation.addBands(aspect).addBands(slope);
+
+var bands = ["elevation","slope","aspect"];
+var samp = elist.select(bands).sampleRegions({
+collection: bpts,
+properties: ['topographic'],
+scale: 30
+});
+print('samp',samp);
+
+var fc = ee.FeatureCollection(bpts.map(function(point) {
+  return ee.Feature(null, {'sFIDp1': point});
+}));
+
+
+var asp = aspect.map(function(image) {
+  return image.reduceRegions({
+    collection: bpts.select(['sFIDp1']), 
+    reducer: ee.Reducer.mean(), 
+    scale: 30})
+    .map(function(f) { 
+      var date = ee.Date(image.get('system:time_start'));
+      return f.set('imageId', date);
+    });
+})
+.flatten();
+
+var desc1 = tname; 
+Export.table.toCloudStorage({
+  collection: triplets,
+  description: desc1, 
+  bucket:'rsleedownloads', 
+  fileNamePrefix: desc1, 
+  fileFormat: 'CSV', 
+  });
+// ~~~~~~~~~~~ END Export aspect to table (post processing add-on) ~~~~~~~~~~~~~~~~~

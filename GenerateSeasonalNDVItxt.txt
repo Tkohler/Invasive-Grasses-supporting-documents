@@ -1,0 +1,95 @@
+
+// Calculate max spring NDVI & min fall NDVI for a user-specified temporal window of Landsat images and user-specified geographic area.
+// The results are two outputs "min" and "max" which contain as many bands as there are years of a time series
+
+// Includes functions from the LandTrendr library (For questions on LandTrendr contact Justin Braaten jstnbraaten@gmail.com)
+// To add the library: https://code.earthengine.google.com/?accept_repo=users/emaprlab/public
+// Parts of this script were modified from some of the examples at https://emapr.github.io/LT-GEE/api.html
+
+// Modified from original to generate a max spring NDVI & min fall NDVI for SoCal 2018
+
+var startYear = 2018; 
+var endYear = 2018;    
+var startDay = '04-01'; 
+var endDay = '05-15'; 
+var maskThese = ['cloud', 'shadow', 'snow', 'water']; 
+var projection = 'EPSG:5070'; 
+var aoi = socal;
+
+// define NDVI calculation
+// NDII for L7/L8 - use ['B4', 'B5'] - use bands for L7 because L8 bands are renamed to match L7 in LandTrendr getCombinedSRcollection function
+var transform = function(img){ 
+  img = img.normalizedDifference(['B4', 'B3']) // calculate normalized dif between ie band 4 and band 3 (B4-B3/B4plusB3)
+                .select([0], ['NDVI'])
+                .multiply(10000) // scale so that we can retain 4 places of decimal precision but output as 16bit
+                .toShort()
+                .set('system:time_start', img.get('system:time_start'))
+                .resample('bicubic');
+  return img;
+};
+
+// Stack an image collection
+var stackCollection = function(collection) {
+  var first = ee.Image(collection.first()).select([]);
+  var appendBands = function(image, previous) {
+    return ee.Image(previous).addBands(image);
+  };
+  return ee.Image(collection.iterate(appendBands, first));
+};
+
+var gDriveFolder = 'vegindices';
+
+// Reference the ltgee library so LandTrendr functions can be used
+var ltgee = require('users/emaprlab/public:Modules/LandTrendr.js');
+
+var collections = [];
+var collection;
+var statCollection = [];
+var medCollection = [];
+var medianCollection = [];
+var medlist = [];
+
+// For each year starting with startYear, while it's <= endYear, incrementing by 1
+for(var year=startYear;year<=endYear;year++){
+  collection = ltgee.getCombinedSRcollection(year, startDay, endDay, aoi, maskThese);
+  collection = collection.map(transform);
+  var ICall = ee.ImageCollection(collection);
+  var absmax = collection.max().select([0],['absmax']);
+  var absmin = collection.min().select([0],['absmin']);
+  var img = absmax.addBands(absmin);
+  statCollection = statCollection.concat(img);
+}
+
+statCollection = ee.ImageCollection(statCollection);
+//print("statCollection = ", statCollection);
+var minCollection = statCollection.select('absmin');
+var maxCollection = statCollection.select('absmax');
+var absminStack = ltgee.collectionToBandStack(minCollection, startYear, endYear, -9999).clip(aoi);
+var absmaxStack = ltgee.collectionToBandStack(maxCollection, startYear, endYear, -9999).clip(aoi);
+
+//Map.addLayer(absminStack, {}, 'absmin');
+//Map.addLayer(absmaxStack, {}, 'absmax');
+
+var fileNamePrefix = 'minNDVI';
+Export.image.toDrive({
+  'image': absminStack, 
+  'region': aoi, 
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'crs': projection,
+  'scale':30,
+  'maxPixels': 1e13
+});
+
+var fileNamePrefix = 'maxNDVI';
+Export.image.toDrive({
+  'image': absmaxStack, 
+  'region': aoi, 
+  'description': fileNamePrefix, 
+  'folder': gDriveFolder, 
+  'fileNamePrefix': fileNamePrefix,
+  'crs': projection,
+  'scale':30,
+  'maxPixels': 1e13
+});
